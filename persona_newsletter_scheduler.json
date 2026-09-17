@@ -1,0 +1,245 @@
+{
+  "name": "Persona - Newsletter Scheduler",
+  "nodes": [
+    {
+      "id": "schedule-trigger-001",
+      "name": "Run Every 2 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        500
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 2
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "webhook-newsletter-001",
+      "name": "Newsletter Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        660
+      ],
+      "parameters": {
+        "path": "persona-send-newsletter",
+        "responseMode": "onReceived",
+        "responseData": "firstEntryJson",
+        "options": {}
+      },
+      "webhookId": "persona-newsletter-webhook-001"
+    },
+    {
+      "id": "get-users-001",
+      "name": "Get Due Users and Fetch News",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        500
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const fs = require('fs'), path = require('path'), https = require('https'), http = require('http');\nconst DIR = '/tmp/persona';\nconst FILE = path.join(DIR, 'users.json');\nconst PENDING_FILE = path.join(DIR, 'pending.json');\n\nfunction loadData() {\n  if (!fs.existsSync(FILE)) return { users: {}, sessions: {} };\n  try { return JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch(e) { return { users: {}, sessions: {} }; }\n}\n\nfunction fetchURL(url, redirects) {\n  redirects = redirects === undefined ? 3 : redirects;\n  return new Promise((resolve) => {\n    const mod = url.startsWith('https') ? https : http;\n    const req = mod.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Persona/1.0)' }, timeout: 8000 }, (res) => {\n      if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location && redirects > 0) {\n        return resolve(fetchURL(res.headers.location, redirects - 1));\n      }\n      let data = ''; res.on('data', c => data += c); res.on('end', () => resolve(data));\n    });\n    req.on('error', () => resolve('')); req.on('timeout', () => { req.destroy(); resolve(''); });\n  });\n}\n\nfunction parseRSS(xml, max) {\n  max = max || 8;\n  const items = [], rx = /<item>([\\s\\S]*?)<\\/item>/g;\n  let m;\n  while ((m = rx.exec(xml)) !== null && items.length < max) {\n    const s = m[1];\n    const title = ((s.match(/<title>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?<\\/title>/) || [])[1] || '').trim();\n    const link = ((s.match(/<link>([^<]+)<\\/link>/) || s.match(/<link[^>]+href=\"([^\"]+)\"/) || [])[1] || '').trim();\n    const desc = ((s.match(/<description>(?:<!\\[CDATA\\[)?([\\s\\S]*?)(?:\\]\\]>)?<\\/description>/) || [])[1] || '').replace(/<[^>]+>/g, '').trim().slice(0, 200);\n    if (title && link) items.push({ title, link, description: desc });\n  }\n  return items;\n}\n\nconst data = loadData();\nconst now = new Date();\nconst dayMap = ['sun','mon','tue','wed','thu','fri','sat'];\nconst curDay = dayMap[now.getDay()];\nconst curMin = now.getHours() * 60 + now.getMinutes();\n\nlet pending = [];\nif (fs.existsSync(PENDING_FILE)) {\n  try { pending = JSON.parse(fs.readFileSync(PENDING_FILE, 'utf8')); } catch(e) {}\n  try { fs.writeFileSync(PENDING_FILE, '[]'); } catch(e) {}\n}\n\nconst dueUsers = Object.entries(data.users).filter(([un, u]) => {\n  if (!u.email || !u.topics || !u.topics.length) return false;\n  if (pending.includes(un)) return true;\n  if (!u.active || !u.schedule_time) return false;\n  if (u.schedule_days && u.schedule_days.length && !u.schedule_days.includes(curDay)) return false;\n  const [h, mi] = u.schedule_time.split(':').map(Number);\n  if (Math.abs(curMin - (h * 60 + mi)) > 1) return false;\n  if (u.last_newsletter && new Date(u.last_newsletter).toDateString() === now.toDateString()) return false;\n  return true;\n}).map(([un, u]) => ({ username: un, email: u.email, topics: u.topics, display_name: u.display_name || un, custom_prompt: u.custom_prompt || null }));\n\nif (dueUsers.length === 0) return [];\n\nconst FEEDS = [\n  { url: 'http://feeds.bbci.co.uk/news/rss.xml', category: 'General' },\n  { url: 'http://feeds.bbci.co.uk/news/technology/rss.xml', category: 'Technology' },\n  { url: 'http://feeds.bbci.co.uk/news/science_and_environment/rss.xml', category: 'Science' },\n  { url: 'http://feeds.bbci.co.uk/news/business/rss.xml', category: 'Business' },\n  { url: 'http://feeds.bbci.co.uk/news/health/rss.xml', category: 'Health' },\n  { url: 'http://feeds.bbci.co.uk/news/world/rss.xml', category: 'World' },\n  { url: 'https://techcrunch.com/feed/', category: 'Technology' },\n  { url: 'http://feeds.bbci.co.uk/sport/rss.xml', category: 'Sports' },\n  { url: 'http://feeds.bbci.co.uk/news/politics/rss.xml', category: 'Politics' },\n  { url: 'http://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml', category: 'Entertainment' },\n  { url: 'https://www.theguardian.com/environment/climate-crisis/rss', category: 'Climate' }\n];\n\nconst seen = new Set(), allArticles = [];\nfor (const feed of FEEDS) {\n  try {\n    const xml = await fetchURL(feed.url);\n    if (!xml) continue;\n    for (const item of parseRSS(xml, 8)) {\n      if (!seen.has(item.link)) { seen.add(item.link); allArticles.push({ ...item, category: feed.category }); }\n    }\n  } catch(e) {}\n}\n\nreturn dueUsers.map(user => ({ json: { ...user, articles: allArticles, fetched_at: now.toISOString() } }));"
+      }
+    },
+    {
+      "id": "build-newsletter-prompt-001",
+      "name": "Build Newsletter Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        500
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().map(item => {\n  const { username, email, topics, display_name, custom_prompt, articles } = item.json;\n\n  const articlesText = (articles || []).map((a, i) =>\n    (i+1) + '. [' + a.category + '] ' + a.title + '\\n   ' + a.description + '\\n   URL: ' + a.link\n  ).join('\\n\\n');\n\n  const system_prompt = 'You are a professional newsletter editor for Persona. Write the newsletter directly in clean HTML (no markdown, no code blocks).\\nUse this structure: <h2> for title, <h3> for article headlines, <p> for paragraphs, <a href=\\'URL\\'> for links, <hr> between sections, <strong> for emphasis.\\nDo NOT use **, *, ##, ---, or any markdown. Output only HTML fragment (no html/head/body tags).\\nTone: professional but approachable. Select 5-8 most relevant articles. Be concise.' + (custom_prompt ? '\\nUser preferences: ' + custom_prompt : '');\n\n  const user_prompt = 'Write a newsletter for ' + display_name + ' interested in: ' + (topics || []).join(', ') + '.\\n\\nAvailable articles (' + (articles || []).length + '):\\n\\n' + articlesText + '\\n\\nSelect the most relevant and write the newsletter.';\n\n  return { json: { username, email, topics, display_name, custom_prompt, system_prompt, user_prompt } };\n});"
+      }
+    },
+    {
+      "id": "call-mistral-newsletter-001",
+      "name": "Call Mistral (Newsletter)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        500
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ model: 'mistral-small-latest', messages: [{ role: 'system', content: $json.system_prompt }, { role: 'user', content: $json.user_prompt }], max_tokens: 1500, temperature: 0.7 }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_MISTRAL_HEADER_CREDENTIAL_ID",
+          "name": "Mistral Bearer Token"
+        }
+      }
+    },
+    {
+      "id": "build-email-001",
+      "name": "Build Email Content",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1040,
+        500
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const mistralItems = $input.all();\nconst userItems = $('Build Newsletter Prompt').all();\nconst dateStr = new Date().toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });\n\nreturn mistralItems.map((response, i) => {\n  const userData = (userItems[i] || userItems[0]).json;\n  let newsletterText;\n  try { newsletterText = response.json.choices[0].message.content; }\n  catch(e) { newsletterText = 'Unable to generate newsletter. Please try again.'; }\n\n  const topics = (userData.topics || []).join(', ');\n  const css = 'body{font-family:Georgia,serif;max-width:680px;margin:0 auto;padding:24px;color:#222;line-height:1.6}h1{color:#1a1a2e;border-bottom:3px solid #2563eb;padding-bottom:10px}h2{color:#1a1a2e;font-size:20px;margin-top:28px}h3{color:#1e40af;font-size:16px;margin-top:20px;margin-bottom:6px}p{margin:8px 0;font-size:15px}a{color:#2563eb;text-decoration:none}hr{border:none;border-top:1px solid #e5e7eb;margin:20px 0}.footer{margin-top:36px;padding-top:16px;border-top:1px solid #e5e7eb;font-size:12px;color:#9ca3af}.badge{background:#eff6ff;color:#1d4ed8;font-size:11px;padding:2px 8px;border-radius:12px}';\n  const htmlBody = '<!DOCTYPE html><html><head><meta charset=\\'UTF-8\\'><style>' + css + '</style></head><body><h1>Persona Newsletter</h1><p style=\\'color:#6b7280;font-size:13px\\'>' + dateStr + '</p><p><span class=\\'badge\\'>' + topics + '</span></p>' + newsletterText + '<div class=\\'footer\\'><p>You received this because you subscribed to Persona.<br>Topics: ' + topics + ' | To unsubscribe or delete your data (GDPR), use the Persona chatbot.</p></div></body></html>';\n\n  return {\n    json: {\n      to_email: userData.email,\n      username: userData.username,\n      display_name: userData.display_name,\n      subject: 'Votre Newsletter Persona \u2014 ' + dateStr,\n      body_text: newsletterText,\n      body_html: htmlBody,\n      sent_at: new Date().toISOString()\n    }\n  };\n});"
+      }
+    },
+    {
+      "id": "send-email-001",
+      "name": "Send Newsletter Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1300,
+        500
+      ],
+      "parameters": {
+        "fromEmail": "persona@yourdomain.com",
+        "toEmail": "={{ $json.to_email }}",
+        "subject": "={{ $json.subject }}",
+        "text": "={{ $json.body_text }}",
+        "html": "={{ $json.body_html }}",
+        "options": {}
+      },
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_WITH_YOUR_SMTP_CREDENTIAL_ID",
+          "name": "SMTP Account"
+        }
+      }
+    },
+    {
+      "id": "update-timestamp-001",
+      "name": "Update Last Newsletter Timestamp",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        500
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const fs = require('fs');\nconst FILE = '/tmp/persona/users.json';\n\n// Read from Build Email Content since emailSend may not pass custom fields through\nconst items = $('Build Email Content').all();\n\nfor (const item of items) {\n  const { username, sent_at } = item.json;\n  if (username) {\n    try {\n      const data = JSON.parse(fs.readFileSync(FILE, 'utf8'));\n      if (data.users[username]) {\n        data.users[username].last_newsletter = sent_at;\n        fs.writeFileSync(FILE, JSON.stringify(data, null, 2));\n      }\n    } catch(e) {}\n  }\n}\n\nreturn items.map(item => ({ json: { success: true, username: item.json.username, to_email: item.json.to_email, sent_at: item.json.sent_at } }));"
+      }
+    }
+  ],
+  "connections": {
+    "Run Every 2 Minutes": {
+      "main": [
+        [
+          {
+            "node": "Get Due Users and Fetch News",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Newsletter Webhook": {
+      "main": [
+        [
+          {
+            "node": "Get Due Users and Fetch News",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Due Users and Fetch News": {
+      "main": [
+        [
+          {
+            "node": "Build Newsletter Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Newsletter Prompt": {
+      "main": [
+        [
+          {
+            "node": "Call Mistral (Newsletter)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call Mistral (Newsletter)": {
+      "main": [
+        [
+          {
+            "node": "Build Email Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Email Content": {
+      "main": [
+        [
+          {
+            "node": "Send Newsletter Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Newsletter Email": {
+      "main": [
+        [
+          {
+            "node": "Update Last Newsletter Timestamp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "persona-scheduler",
+  "versionId": "persona-scheduler-v1",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": [
+    {
+      "id": "persona",
+      "name": "persona"
+    }
+  ]
+}
