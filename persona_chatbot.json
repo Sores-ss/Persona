@@ -1,0 +1,191 @@
+{
+  "name": "Persona - Chatbot",
+  "nodes": [
+    {
+      "id": "chat-trigger-001",
+      "name": "When chat message received",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "options": {}
+      },
+      "webhookId": "persona-chatbot-webhook-001"
+    },
+    {
+      "id": "build-context-001",
+      "name": "Build Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const fs = require('fs'), path = require('path');\nconst DIR = '/tmp/persona';\nconst USERS_FILE = path.join(DIR, 'users.json');\n\nconst sessionId = $input.first().json.sessionId;\nconst userMessage = $input.first().json.chatInput;\n\nlet data = { users: {}, sessions: {} };\nif (fs.existsSync(USERS_FILE)) {\n  try { data = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch(e) {}\n}\n\nlet isAuthenticated = false, loggedInAs = null, profileInfo = 'none';\nconst session = data.sessions[sessionId];\nif (session && new Date(session.expires) > new Date()) {\n  isAuthenticated = true;\n  loggedInAs = session.username;\n  const u = data.users[loggedInAs];\n  if (u) profileInfo = 'email=' + (u.email||'not set') + ', topics=' + (u.topics.join(',')||'none') + ', schedule=' + (u.schedule_time||'not set') + ', active=' + u.active;\n}\n\nconst histFile = path.join(DIR, 'hist_' + sessionId + '.json');\nlet history = [];\nif (fs.existsSync(histFile)) {\n  try { history = JSON.parse(fs.readFileSync(histFile, 'utf8')); } catch(e) {}\n}\n\nconst intentSystemPrompt = `You are an intent classifier for Persona, a newsletter chatbot.\nReturn ONLY a valid JSON object, no explanation.\n\nCurrent state:\n- Session: ${sessionId}\n- Authenticated: ${isAuthenticated}${isAuthenticated ? ' as ' + loggedInAs + ' | ' + profileInfo : ''}\n\nJSON format: {\"action\":\"ACTION_NAME\",\"params\":{...}}\n\nActions:\n- none \u2014 just chatting, no operation needed. NOTE: if the user asks about their topics, email, schedule, or profile, use get_profile instead of none\n- register \u2014 params: {\"username\":\"...\",\"password\":\"...\",\"email\":\"...\"(optional)}\n- login \u2014 params: {\"username\":\"...\",\"password\":\"...\"}\n- logout \u2014 params: {}\n- get_profile \u2014 params: {}\n- update_topics \u2014 params: {\"topics\":\"technology,science,...\", \"mode\":\"replace\" or \"add\" or \"remove\"} \u2014 use mode \"add\" when user wants to ADD to existing topics, mode \"remove\" when user wants to REMOVE specific topics, mode \"replace\" when user wants to SET all topics. When user says \"add all\" use all valid topics with mode \"replace\". Valid: technology,science,world,business,health,politics,sports,entertainment,climate\n- update_email \u2014 params: {\"email\":\"...\"}\n- update_schedule \u2014 params: {\"time\":\"HH:MM\",\"days\":\"mon,tue,...\",\"timezone\":\"...\"(optional)}\n- request_newsletter \u2014 params: {}\n- unsubscribe \u2014 params: {}\n- delete_account \u2014 params: {\"confirm\":\"DELETE\"}\n\nIf required params are missing, use action \"none\".\nOnly register and login work without authentication.`;\n\nreturn [{\n  json: {\n    sessionId, userMessage, histFile, history, isAuthenticated, loggedInAs,\n    intentMessages: [\n      { role: 'system', content: intentSystemPrompt },\n      ...history,\n      { role: 'user', content: userMessage }\n    ]\n  }\n}];"
+      }
+    },
+    {
+      "id": "extract-intent-001",
+      "name": "Extract Intent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ model: 'mistral-small-latest', messages: $json.intentMessages, response_format: { type: 'json_object' }, max_tokens: 200, temperature: 0.1 }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_MISTRAL_HEADER_CREDENTIAL_ID",
+          "name": "Mistral Bearer Token"
+        }
+      }
+    },
+    {
+      "id": "execute-op-001",
+      "name": "Execute Operation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const fs = require('fs'), path = require('path'), crypto = require('crypto');\nconst DIR = '/tmp/persona';\nconst USERS_FILE = path.join(DIR, 'users.json');\nconst PENDING_FILE = path.join(DIR, 'pending.json');\n\nconst intentRaw = $input.first().json.choices[0].message.content;\nconst ctx = $('Build Context').first().json;\nconst { sessionId, userMessage, histFile, history, isAuthenticated, loggedInAs } = ctx;\n\nlet action = 'none', params = {};\ntry { const p = JSON.parse(intentRaw); action = p.action||'none'; params = p.params||{}; } catch(e) {}\n\nconst load = () => {\n  if (!fs.existsSync(DIR)) fs.mkdirSync(DIR,{recursive:true});\n  if (!fs.existsSync(USERS_FILE)){const d={users:{},sessions:{}};fs.writeFileSync(USERS_FILE,JSON.stringify(d,null,2));return d;}\n  try{return JSON.parse(fs.readFileSync(USERS_FILE,'utf8'));}catch(e){return{users:{},sessions:{}};}\n};\nconst save = d => {if(!fs.existsSync(DIR))fs.mkdirSync(DIR,{recursive:true});fs.writeFileSync(USERS_FILE,JSON.stringify(d,null,2));};\nconst auth = (d,sid) => {const s=d.sessions[sid];if(!s)return null;if(new Date(s.expires)<new Date()){delete d.sessions[sid];save(d);return null;}return s.username;};\n\nlet opResult = '';\n\nif (action !== 'none') {\n  const d = load();\n  if (action === 'register') {\n    const u=(params.username||'').trim(), pw=params.password||'', em=(params.email||'').trim();\n    if(!u||!pw) opResult='Error: username and password are required.';\n    else if(!/^[a-zA-Z0-9_-]{3,20}$/.test(u)) opResult='Error: username must be 3-20 alphanumeric characters.';\n    else if(pw.length<8) opResult='Error: password must be at least 8 characters.';\n    else if(em&&!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(em)) opResult='Error: invalid email format.';\n    else if(d.users[u.toLowerCase()]) opResult='Error: username already taken.';\n    else {\n      const salt=crypto.randomBytes(16).toString('hex');\n      const hash=crypto.pbkdf2Sync(pw,salt,10000,64,'sha256').toString('hex');\n      d.users[u.toLowerCase()]={display_name:u,password:salt+':'+hash,email:em||null,topics:[],schedule_time:null,schedule_days:['mon','tue','wed','thu','fri'],timezone:'UTC',active:false,gdpr_consent:true,gdpr_consent_date:new Date().toISOString(),created_at:new Date().toISOString(),last_newsletter:null};\n      save(d); opResult='Success: account created for \"'+u+'\". GDPR notice: your email (if provided) is stored only for newsletter delivery. You can unsubscribe or delete your account at any time.';\n    }\n  }\n  else if (action === 'login') {\n    const u=(params.username||'').toLowerCase(), pw=params.password||'';\n    const user=d.users[u];\n    if(!user) opResult='Error: invalid username or password.';\n    else {\n      const [salt,hash]=user.password.split(':');\n      const test=crypto.pbkdf2Sync(pw,salt,10000,64,'sha256').toString('hex');\n      if(test!==hash) opResult='Error: invalid username or password.';\n      else {\n        d.sessions[sessionId]={username:u,expires:new Date(Date.now()+6*3600000).toISOString()};\n        save(d);\n        opResult='Success: logged in as \"'+user.display_name+'\". Topics: '+(user.topics.join(', ')||'not set')+'. Email: '+(user.email||'not set')+'. Schedule: '+(user.schedule_time||'not set')+'.';\n      }\n    }\n  }\n  else if (action === 'logout') {\n    if(d.sessions[sessionId]){delete d.sessions[sessionId];save(d);opResult='Success: logged out.';}\n    else opResult='No active session.';\n  }\n  else if (action === 'get_profile') {\n    const un=auth(d,sessionId);\n    if(!un) opResult='Error: not authenticated.';\n    else {const u=d.users[un];opResult='Profile: '+JSON.stringify({username:un,email:u.email,topics:u.topics,schedule:u.schedule_time,days:u.schedule_days,active:u.active,last_newsletter:u.last_newsletter},null,2);}\n  }\n  else if (action === 'update_topics') {\n    const un=auth(d,sessionId);\n    if(!un) opResult='Error: not authenticated.';\n    else {\n      const VALID=['technology','science','world','business','health','politics','sports','entertainment','climate'];\n      const incoming=String(params.topics||'').split(',').map(t=>t.trim().toLowerCase()).filter(t=>VALID.includes(t));\n      if(!incoming.length) opResult='Error: no valid topics. Valid: '+VALID.join(', ');\n      else {\n        const mode=params.mode||'replace';\n        const existing=d.users[un].topics||[];\n        let final;\n        if(mode==='add') final=[...new Set([...existing,...incoming])];\n        else if(mode==='remove') final=existing.filter(t=>!incoming.includes(t));\n        else final=incoming;\n        if(mode==='remove'&&final.length===0){opResult='Error: cannot remove all topics, at least one required.';}\n        else {\n          d.users[un].topics=final;\n          if(d.users[un].email&&d.users[un].schedule_time)d.users[un].active=true;\n          save(d);\n          const check=JSON.parse(fs.readFileSync(USERS_FILE,'utf8'));\n          const saved=check.users[un]?.topics||[];\n          opResult='Success: topics '+(mode==='add'?'added':mode==='remove'?'removed':'set')+', now: '+saved.join(', ')+'. Newsletter active: '+d.users[un].active;\n        }\n      }\n    }\n  }\n  else if (action === 'update_email') {\n    const un=auth(d,sessionId);\n    if(!un) opResult='Error: not authenticated.';\n    else if(!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(params.email||'')) opResult='Error: invalid email format.';\n    else {d.users[un].email=params.email;if(d.users[un].topics.length&&d.users[un].schedule_time)d.users[un].active=true;save(d);opResult='Success: email set to '+params.email+'. Newsletter active: '+d.users[un].active;}\n  }\n  else if (action === 'update_schedule') {\n    const un=auth(d,sessionId);\n    if(!un) opResult='Error: not authenticated.';\n    else if(!/^([01]\\d|2[0-3]):[0-5]\\d$/.test(params.time||'')) opResult='Error: time must be HH:MM format.';\n    else {\n      const DAYS=['mon','tue','wed','thu','fri','sat','sun'];\n      const days=String(params.days||'mon,tue,wed,thu,fri').split(',').map(x=>x.trim().toLowerCase()).filter(x=>DAYS.includes(x));\n      const prevTime=d.users[un].schedule_time;\n      d.users[un].schedule_time=params.time;\n      d.users[un].schedule_days=days;\n      if(params.timezone)d.users[un].timezone=params.timezone;\n      if(prevTime!==params.time)d.users[un].last_newsletter=null;\n      if(d.users[un].email&&d.users[un].topics.length)d.users[un].active=true;\n      save(d);\n      opResult='Success: schedule set to '+params.time+' on '+days.join(', ')+(prevTime!==params.time?' (last_newsletter reset, will send at new time today if due)':'')+'. Newsletter active: '+d.users[un].active;\n    }\n  }\n  else if (action === 'request_newsletter') {\n    const un=auth(d,sessionId);\n    if(!un) opResult='Error: not authenticated.';\n    else if(!d.users[un].email) opResult='Error: please set your email first.';\n    else if(!d.users[un].topics.length) opResult='Error: please set your topics first.';\n    else {\n      let p=[];if(fs.existsSync(PENDING_FILE)){try{p=JSON.parse(fs.readFileSync(PENDING_FILE,'utf8'));}catch(e){}}\n      if(!p.includes(un)){p.push(un);fs.writeFileSync(PENDING_FILE,JSON.stringify(p,null,2));}\n      try{\n        const http=require('http');\n        const req=http.request({hostname:'localhost',port:5678,path:'/webhook/persona-send-newsletter',method:'POST',headers:{'Content-Type':'application/json'}},()=>{});\n        req.on('error',()=>{});\n        req.write(JSON.stringify({trigger:'chat',username:un}));\n        req.end();\n      }catch(e){}\n      opResult='Success: newsletter triggered for '+d.users[un].email+'. It will arrive in about a minute.';\n    }\n  }\n  else if (action === 'unsubscribe') {\n    const un=auth(d,sessionId);\n    if(!un) opResult='Error: not authenticated.';\n    else {d.users[un].active=false;save(d);opResult='Success: unsubscribed. Account preserved. Use delete_account to erase all data (GDPR Article 17).';}\n  }\n  else if (action === 'delete_account') {\n    if(params.confirm!=='DELETE') opResult='To confirm permanent deletion, set confirm to exactly \"DELETE\". This cannot be undone (GDPR Article 17).';\n    else {\n      const un=auth(d,sessionId);\n      if(!un) opResult='Error: not authenticated.';\n      else {const name=d.users[un].display_name;delete d.users[un];delete d.sessions[sessionId];save(d);opResult='Success: account \"'+name+'\" permanently deleted. GDPR Article 17.';}\n    }\n  }\n}\n\nconst replySystemPrompt = 'You are Persona, a newsletter assistant. Respond naturally to the user based on the operation result.\\nBe concise and helpful. Respond in the user language.\\nIf the result starts with Error:, explain the problem and how to fix it.\\nIf the result starts with Success:, confirm and guide the user to the next step.\\nIf action was none, just chat helpfully.\\nNever mention technical details like session IDs or JSON.\\nIMPORTANT: Do NOT invent features that do not exist. There is no email confirmation system, no admin panel, no payment system, no public profiles. Only these features exist: register, login, logout, view profile, set topics, set email, set schedule, request newsletter, unsubscribe, delete account.';\n\nconst replyMessages = [\n  { role: 'system', content: replySystemPrompt },\n  ...history,\n  { role: 'user', content: userMessage },\n  { role: 'assistant', content: opResult || '(no operation performed)' },\n  { role: 'user', content: 'Based on the above result, write your response to the user.' }\n];\n\nreturn [{ json: { sessionId, userMessage, histFile, history, action, opResult, replyMessages } }];"
+      }
+    },
+    {
+      "id": "format-response-001",
+      "name": "Format Response",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1040,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ model: 'mistral-small-latest', messages: $json.replyMessages, max_tokens: 500, temperature: 0.7 }) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_YOUR_MISTRAL_HEADER_CREDENTIAL_ID",
+          "name": "Mistral Bearer Token"
+        }
+      }
+    },
+    {
+      "id": "save-history-001",
+      "name": "Save History",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1300,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const fs = require('fs');\nconst reply = $input.first().json.choices[0].message.content;\nconst ctx = $('Execute Operation').first().json;\nconst { sessionId, userMessage, histFile, history } = ctx;\n\ntry {\n  const newHist = [\n    ...history,\n    { role: 'user', content: userMessage },\n    { role: 'assistant', content: reply }\n  ].slice(-20);\n  fs.writeFileSync(histFile, JSON.stringify(newHist, null, 2));\n} catch(e) {}\n\nreturn [{ json: { text: reply } }];"
+      }
+    }
+  ],
+  "connections": {
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Build Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Context": {
+      "main": [
+        [
+          {
+            "node": "Extract Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Intent": {
+      "main": [
+        [
+          {
+            "node": "Execute Operation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Operation": {
+      "main": [
+        [
+          {
+            "node": "Format Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Response": {
+      "main": [
+        [
+          {
+            "node": "Save History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "persona-chatbot",
+  "versionId": "persona-chatbot-v1",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": [
+    {
+      "id": "persona",
+      "name": "persona"
+    }
+  ]
+}
